@@ -1,10 +1,13 @@
 // Copyright (C) 2026 Evgeny Zoshchuk (JordanCpp). Licensed under LGPL-3.0-or-later.
 
 #include <WinCore/Application.hpp>
+#include <WinCore/MessageBoxDialog.hpp>
+#include <new>
+#include <cstring>
 
 ATOM RegisterClassA(const WNDCLASSA* lpWndClass)
 {
-	if (!lpWndClass || !lpWndClass->lpszClassName || !lpWndClass->lpfnWndProc)
+	if (!lpWndClass || !lpWndClass->lpszClassName || !lpWndClass->lpfnWndProc || lpWndClass->cbWndExtra < 0 || lpWndClass->cbClsExtra < 0)
 	{
 		MainApplication().SetLastError(ERROR_INVALID_PARAMETER);
 		return 0;
@@ -30,72 +33,126 @@ ATOM RegisterClassA(const WNDCLASSA* lpWndClass)
 	return atom;
 }
 
-HWND CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
+// Fetch the procedure for every message: it may change during a callback.
+static LRESULT DispatchWindow(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
-	if (!MainApplication()._initializer.IsInitialized())
-	{
-		MainApplication().SetLastError(ERROR_INVALID_PARAMETER);
-		return NULL;
-	}
-
-	Window* window = MainApplication()._windowCreator.Create(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
-	
-	if (!window)
-	{
-		return NULL;
-	}
-
-	HWND hFakeWnd = (HWND)window;
-
-	MainApplication()._windowManager.Append(hFakeWnd, window);
-
-	WindowClassA windowClass;
-
-	if (MainApplication()._classRegistrator.Find(lpClassName, windowClass))
-	{
-		CREATESTRUCTA cs;
-		cs.lpCreateParams = lpParam;
-		cs.hInstance = hInstance;
-		cs.hMenu = hMenu;
-		cs.hwndParent = hWndParent;
-		cs.cy = nHeight;
-		cs.cx = nWidth;
-		cs.y = Y;
-		cs.x = X;
-		cs.style = dwStyle;
-		cs.lpszName = lpWindowName;
-		cs.lpszClass = lpClassName;
-		cs.dwExStyle = dwExStyle;
-
-		windowClass.lpfnWndProc(hFakeWnd, WM_CREATE, 0, (LPARAM)&cs);
-	}
-
-	return hFakeWnd;
+	WindowData* data = MainApplication()._windowManager.Data(hwnd);
+	if (!data) return 0;
+	WNDPROC proc = reinterpret_cast<WNDPROC>(data->values[GWLP_WNDPROC]);
+	return proc ? proc(hwnd, message, wparam, lparam) : 0;
 }
 
-BOOL DestroyWindow(HWND hWnd)
+HWND CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
 {
-	if (!hWnd)
-	{
-		return FALSE;
-	}
-
-	Window* window = MainApplication()._windowManager.Find(hWnd);
-
-	if (!window)
-	{
-		return FALSE;
-	}
-
+	WindowManager& manager = MainApplication()._windowManager;
 	WindowClassA windowClass;
-
-	if (MainApplication()._classRegistrator.Find(window->GetClassName(), windowClass))
+	if (!lpClassName || !MainApplication()._classRegistrator.Find(lpClassName, windowClass))
 	{
-		windowClass.lpfnWndProc(hWnd, WM_DESTROY, 0, 0);
-		windowClass.lpfnWndProc(hWnd, WM_NCDESTROY, 0, 0);
+		SetLastError(ERROR_CLASS_DOES_NOT_EXIST);
+		return NULL;
 	}
+	if (!MainApplication()._initializer.IsInitialized())
+	{
+		SetLastError(ERROR_GEN_FAILURE);
+		return NULL;
+	}
+	WindowData data;
+	data.values[GWLP_USERDATA] = 0;
+	data.values[GWLP_WNDPROC] = reinterpret_cast<LONG_PTR>(windowClass.lpfnWndProc);
+	data.values[GWLP_HINSTANCE] = reinterpret_cast<LONG_PTR>(hInstance);
+	data.values[GWLP_HWNDPARENT] = reinterpret_cast<LONG_PTR>(hWndParent);
+	data.values[GWLP_ID] = (dwStyle & WS_CHILD) ? reinterpret_cast<LONG_PTR>(hMenu) : 0;
+	data.values[GWL_STYLE] = static_cast<LONG>(dwStyle);
+	data.values[GWL_EXSTYLE] = static_cast<LONG>(dwExStyle);
+	data.extra.resize(windowClass.cbWndExtra, 0);
+	Window* window = MainApplication()._windowCreator.Create(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+	if (!window || !window->Native())
+	{
+		delete window;
+		SetLastError(ERROR_GEN_FAILURE);
+		return NULL;
+	}
+	HWND hwnd = reinterpret_cast<HWND>(window);
+	manager.Append(hwnd, window, data);
+	CREATESTRUCTA cs;
+	cs.lpCreateParams = lpParam; cs.hInstance = hInstance; cs.hMenu = hMenu;
+	cs.hwndParent = hWndParent; cs.cy = nHeight; cs.cx = nWidth; cs.y = Y; cs.x = X;
+	cs.style = dwStyle; cs.lpszName = lpWindowName; cs.lpszClass = lpClassName; cs.dwExStyle = dwExStyle;
+	LRESULT accepted = DispatchWindow(hwnd, WM_NCCREATE, 0, reinterpret_cast<LPARAM>(&cs));
+	if (!manager.Find(hwnd)) return NULL;
+	if (!accepted)
+	{
+		manager.Data(hwnd)->destroying = true;
+		DispatchWindow(hwnd, WM_NCDESTROY, 0, 0);
+		manager.Destroy(hwnd);
+		return NULL;
+	}
+	LRESULT result = DispatchWindow(hwnd, WM_CREATE, 0, reinterpret_cast<LPARAM>(&cs));
+	if (!manager.Find(hwnd)) return NULL;
+	if (result == -1)
+	{
+		DestroyWindow(hwnd);
+		return NULL;
+	}
+	return hwnd;
+}
 
-	return MainApplication()._windowManager.Destroy(hWnd);
+BOOL DestroyWindow(HWND hwnd)
+{
+	WindowManager& manager = MainApplication()._windowManager;
+	WindowData* data = manager.Data(hwnd);
+	if (!data)
+	{
+		SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+		return FALSE;
+	}
+	if (data->destroying) return TRUE;
+	data->destroying = true;
+	DispatchWindow(hwnd, WM_DESTROY, 0, 0);
+	DispatchWindow(hwnd, WM_NCDESTROY, 0, 0);
+	return manager.Destroy(hwnd);
+}
+
+static bool WindowSlot(WindowData* data, int index)
+{
+	if (!data)
+	{
+		SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+		return false;
+	}
+	if (index >= 0)
+	{
+		if (static_cast<size_t>(index) <= data->extra.size() &&
+			sizeof(LONG_PTR) <= data->extra.size() - static_cast<size_t>(index)) return true;
+	}
+	else if (data->values.find(index) != data->values.end()) return true;
+	SetLastError(ERROR_INVALID_INDEX);
+	return false;
+}
+
+LONG_PTR GetWindowLongPtr(HWND hwnd, int index)
+{
+	WindowData* data = MainApplication()._windowManager.Data(hwnd);
+	if (!WindowSlot(data, index)) return 0;
+	LONG_PTR value = 0;
+	if (index >= 0) std::memcpy(&value, &data->extra[index], sizeof(value));
+	else value = data->values[index];
+	return value;
+}
+
+LONG_PTR SetWindowLongPtr(HWND hwnd, int index, LONG_PTR value)
+{
+	WindowData* data = MainApplication()._windowManager.Data(hwnd);
+	if (!WindowSlot(data, index)) return 0;
+	if (index == GWLP_WNDPROC && !value)
+	{
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return 0;
+	}
+	LONG_PTR previous = GetWindowLongPtr(hwnd, index);
+	if (index >= 0) std::memcpy(&data->extra[index], &value, sizeof(value));
+	else data->values[index] = (index == GWL_STYLE || index == GWL_EXSTYLE) ? static_cast<LONG>(value) : value;
+	return previous;
 }
 
 BOOL GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)
@@ -168,6 +225,8 @@ LRESULT DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
 {
 	switch (Msg)
 	{
+	case WM_NCCREATE:
+		return TRUE;
 	case WM_CLOSE:
 		if (hWnd)
 		{
@@ -188,21 +247,7 @@ LRESULT DispatchMessageA(const MSG* lpMsg)
 	}
 
 	if (lpMsg->hwnd)
-	{
-		Window* window = MainApplication()._windowManager.Find(lpMsg->hwnd);
-
-		if (window)
-		{
-			WindowClassA windowClass;
-
-			if (MainApplication()._classRegistrator.Find(window->GetClassName(), windowClass))
-			{
-				return windowClass.lpfnWndProc(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-			}
-		}
-
-		return 0;
-	}
+		return DispatchWindow(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
 
 	const ClassRegistrator::container& classes = MainApplication()._classRegistrator.GetClasses();
 
@@ -395,4 +440,24 @@ LONG ChangeDisplaySettingsA(LPDEVMODEA lpDevMode, DWORD dwFlags)
 	}
 
 	return DISP_CHANGE_SUCCESSFUL;
+}
+
+int MessageBox(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType)
+{
+	MessageBoxDialog dialog;
+	if (!dialog.Configure(uType))
+		return 0;
+
+	void* parent = NULL;
+	if (hWnd)
+	{
+		Window* window = MainApplication()._windowManager.Find(hWnd);
+		if (!window || !window->Native())
+		{
+			SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+			return 0;
+		}
+		parent = window->Native();
+	}
+	return dialog.Show(parent, lpText, lpCaption);
 }

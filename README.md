@@ -79,6 +79,9 @@ WINCORE_API void SetLastError(DWORD dwErrCode);
 
 #### 🖼️ User32.dll
 ```c
+WINCORE_API int MessageBox(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType); /* UTF-8 */
+WINCORE_API LONG_PTR GetWindowLongPtr(HWND hWnd, int nIndex);
+WINCORE_API LONG_PTR SetWindowLongPtr(HWND hWnd, int nIndex, LONG_PTR value);
 WINCORE_API HMODULE GetModuleHandleA(LPCSTR lpModuleName);
 WINCORE_API HBRUSH GetSysColorBrush(int nIndex);
 WINCORE_API ATOM RegisterClassA(const WNDCLASSA* lpWndClass);

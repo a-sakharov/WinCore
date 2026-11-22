@@ -11,8 +11,9 @@ WindowManager::~WindowManager()
 	_windows.clear();
 }
 
-void WindowManager::Append(HWND handle, Window* window)
+void WindowManager::Append(HWND handle, Window* window, const WindowData& data)
 {
+	_data.insert(std::make_pair(handle, data));
 	_windows.insert(std::make_pair(handle, window));
 }
 
@@ -22,6 +23,7 @@ void WindowManager::Remove(HWND handle)
 
 	if (i != _windows.end())
 	{
+		_data.erase(handle);
 		_windows.erase(i);
 	}
 }
@@ -64,6 +66,7 @@ BOOL WindowManager::Destroy(HWND handle)
 	{
 		Window* window = i->second;
 
+		_data.erase(handle);
 		_windows.erase(i);
 		delete window;
 
@@ -76,4 +79,10 @@ BOOL WindowManager::Destroy(HWND handle)
 const WindowManager::container& WindowManager::GetWindows() const
 {
 	return _windows; 
+}
+
+WindowData* WindowManager::Data(HWND handle)
+{
+	std::map<HWND, WindowData>::iterator i = _data.find(handle);
+	return i == _data.end() ? NULL : &i->second;
 }
